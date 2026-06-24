@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
 apscheduler==3.10.4
 notion-client==2.2.1
 pytz==2024.1
+python-telegram-bot==21.9
