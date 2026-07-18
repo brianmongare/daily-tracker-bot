@@ -1,5 +1,5 @@
-apscheduler==3.10.4
-notion-client==2.2.1
-pytz==2024.1
-python-telegram-bot==21.9
+apscheduler==3.10.4 
+notion-client==2.2.1 
+pytz==2024.1 
+python-telegram-bot==21.9 
 google-genai==2.12.1
