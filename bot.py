@@ -233,7 +233,7 @@ async def ask_ai(question: str, context: str | None = None) -> str:
 
     try:
         response = await genai_client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-flash-latest",
             contents=user_content,
             config=types.GenerateContentConfig(
                 system_instruction=system,
