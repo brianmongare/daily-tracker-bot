@@ -1,23 +1,27 @@
 import logging
-import json
 import os
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from collections import Counter
+from datetime import datetime, timedelta
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 from notion_client import Client
+from google import genai
+from google.genai import types
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = int(os.getenv("TELEGRAM_CHAT_ID"))
 NOTION_TOKEN       = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 NAIROBI_TZ         = pytz.timezone("Africa/Nairobi")
+STREAK_THRESHOLD   = 70  # % score needed for a day to "count" toward a streak
 
 # ── Activities ────────────────────────────────────────────────────────────────
 ACTIVITIES = [
@@ -40,6 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 notion = Client(auth=NOTION_TOKEN)
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,6 +114,138 @@ async def log_to_notion(date_str: str, checked: set, score_pct: int):
         logger.error(f"Notion log failed: {e}")
 
 
+# ── Notion queries (for streaks, digest, and grounded Q&A) ───────────────────
+
+async def fetch_recent_logs(days: int) -> list[dict]:
+    """
+    Pull the last `days` days of logs from Notion, oldest first.
+    Returns a list of dicts: {date, score, completed, missed}
+    """
+    cutoff = (datetime.now(NAIROBI_TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+    logs = []
+    try:
+        response = notion.databases.query(
+            database_id=NOTION_DATABASE_ID,
+            filter={"property": "Date", "date": {"on_or_after": cutoff}},
+            sorts=[{"property": "Date", "direction": "ascending"}],
+        )
+        for page in response.get("results", []):
+            props = page["properties"]
+            date_val = props["Date"]["date"]
+            if not date_val:
+                continue
+            score = props["Score"]["number"]
+            completed_rt = props["Completed"]["rich_text"]
+            missed_rt = props["Missed"]["rich_text"]
+            logs.append({
+                "date": date_val["start"],
+                "score": score if score is not None else 0,
+                "completed": completed_rt[0]["plain_text"] if completed_rt else "",
+                "missed": missed_rt[0]["plain_text"] if missed_rt else "",
+            })
+    except Exception as e:
+        logger.error(f"Notion query failed: {e}")
+    return logs
+
+
+def compute_streaks(logs: list[dict], threshold: int = STREAK_THRESHOLD) -> tuple[int, int]:
+    """
+    Returns (current_streak, longest_streak) based on days where score >= threshold.
+    Assumes logs are sorted oldest -> newest.
+    """
+    if not logs:
+        return 0, 0
+
+    hits = [log["score"] >= threshold for log in logs]
+
+    longest = 0
+    running = 0
+    for hit in hits:
+        running = running + 1 if hit else 0
+        longest = max(longest, running)
+
+    current = 0
+    for hit in reversed(hits):
+        if hit:
+            current += 1
+        else:
+            break
+
+    return current, longest
+
+
+def build_week_bar_chart(logs: list[dict]) -> str:
+    """Renders a simple monospace bar chart for the last 7 days."""
+    lines = []
+    for log in logs[-7:]:
+        day_name = datetime.strptime(log["date"], "%Y-%m-%d").strftime("%a")
+        pct = int(log["score"])
+        filled = round(pct / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        lines.append(f"{day_name} {bar} {pct}%")
+    return "\n".join(lines)
+
+
+def most_missed_activity(logs: list[dict]) -> str:
+    counter = Counter()
+    for log in logs:
+        for label in log["missed"].split("\n"):
+            label = label.strip()
+            if label and label != "None":
+                counter[label] += 1
+    if not counter:
+        return "None — great week!"
+    label, count = counter.most_common(1)[0]
+    return f"{label} (missed {count}x)"
+
+
+# ── Claude-powered Q&A ─────────────────────────────────────────────────────────
+
+DATA_KEYWORDS = (
+    "score", "streak", "week", "month", "today", "yesterday",
+    "average", "missed", "completed", "progress", "activity", "days"
+)
+
+
+def looks_data_related(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in DATA_KEYWORDS)
+
+
+async def build_notion_context(days: int = 30) -> str:
+    logs = await fetch_recent_logs(days)
+    if not logs:
+        return "No logged history yet."
+    lines = [f"{log['date']}: {log['score']}% done. Missed: {log['missed'] or 'None'}" for log in logs]
+    return "\n".join(lines)
+
+
+async def ask_ai(question: str, context: str | None = None) -> str:
+    system = (
+        "You are a friendly, encouraging assistant embedded in Brian's personal "
+        "daily habit tracker Telegram bot. Keep answers short (a few sentences), "
+        "conversational, and suited for a Telegram message. If given tracker data, "
+        "base your answer on it precisely rather than guessing."
+    )
+    user_content = question
+    if context:
+        user_content = f"Here is Brian's recent tracker data:\n{context}\n\nQuestion: {question}"
+
+    try:
+        response = await genai_client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=400,
+            ),
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API call failed: {e}")
+        return "⚠️ Sorry, I couldn't reach the AI just now. Try again in a moment."
+
+
 # ── Scheduled messages ────────────────────────────────────────────────────────
 
 async def send_morning_message(app: Application):
@@ -161,13 +298,48 @@ async def send_evening_summary(app: Application):
 
     await log_to_notion(date_str, checked, pct)
 
+    logs = await fetch_recent_logs(90)
+    current, longest = compute_streaks(logs)
+    streak_msg = f"🔥 Current streak: {current} day(s)"
+    if current > 0 and current == longest:
+        streak_msg += " — that's your best ever!"
+
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text="✅ Logged to Notion. See you tomorrow at 6 AM!",
+        text=f"✅ Logged to Notion.\n{streak_msg}\n\nSee you tomorrow at 6 AM!",
     )
 
     # Reset for next day
     daily_state[date_str] = set()
+
+
+async def send_weekly_digest(app: Application):
+    logs = await fetch_recent_logs(7)
+    if not logs:
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="📊 No data logged this week yet — nothing to recap!",
+        )
+        return
+
+    chart = build_week_bar_chart(logs)
+    avg = round(sum(log["score"] for log in logs) / len(logs))
+    top_miss = most_missed_activity(logs)
+    start = logs[0]["date"]
+    end = logs[-1]["date"]
+
+    msg = (
+        f"📊 *Week in Review* ({start} → {end})\n\n"
+        f"```\n{chart}\n```\n"
+        f"*Average: {avg}%*\n"
+        f"*Most-missed:* {top_miss}\n\n"
+        f"New week, fresh momentum 🚀"
+    )
+    await app.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=msg,
+        parse_mode="Markdown"
+    )
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -181,8 +353,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — see today's progress\n"
         "/done 1 3 5 — mark activities as done\n"
         "/reset — clear today's checks\n"
+        "/streak — see your current and best streak\n"
         "/summary — trigger evening summary now\n"
-        "/morning — trigger morning message now",
+        "/morning — trigger morning message now\n"
+        "/digest — trigger weekly digest now\n"
+        "/ask <question> — ask me anything, including about your own progress\n\n"
+        "You can also just type a plain question and I'll answer it.",
         parse_mode="Markdown"
     )
 
@@ -231,8 +407,38 @@ async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_morning_message(context.application)
 
 
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_weekly_digest(context.application)
+
+
+async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logs = await fetch_recent_logs(90)
+    current, longest = compute_streaks(logs)
+    msg = (
+        f"🔥 *Current streak:* {current} day(s)\n"
+        f"🏅 *Longest streak:* {longest} day(s)\n\n"
+        f"_(Counting days at {STREAK_THRESHOLD}%+ over the last 90 days)_"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = " ".join(context.args)
+    if not question:
+        await update.message.reply_text("Ask me something, e.g. `/ask how did I do this week?`", parse_mode="Markdown")
+        return
+    await answer_question(update, question)
+
+
+async def answer_question(update: Update, question: str):
+    await update.message.chat.send_action("typing")
+    context_data = await build_notion_context(30) if looks_data_related(question) else None
+    answer = await ask_ai(question, context_data)
+    await update.message.reply_text(answer)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle plain number replies like '1 3 5'."""
+    """Handle plain text: number replies like '1 3 5', or natural-language questions."""
     text = update.message.text
     ids = parse_numbers(text)
     if ids:
@@ -248,11 +454,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"✅ Got it! *{done}/{total} ({pct}%)*\n\n{build_activity_list(checked)}"
         await update.message.reply_text(msg, parse_mode="Markdown")
     else:
-        await update.message.reply_text(
-            "Reply with numbers to check off activities, e.g. `1 3 5`\n"
-            "Or use /status to see today's list.",
-            parse_mode="Markdown"
-        )
+        # Not a number reply — treat it as a question for Claude
+        await answer_question(update, text)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -267,6 +470,9 @@ def main():
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("morning", cmd_morning))
+    app.add_handler(CommandHandler("digest",  cmd_digest))
+    app.add_handler(CommandHandler("streak",  cmd_streak))
+    app.add_handler(CommandHandler("ask",     cmd_ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Scheduler
@@ -282,6 +488,12 @@ def main():
         CronTrigger(hour=21, minute=0, timezone=NAIROBI_TZ),
         args=[app],
         id="evening"
+    )
+    scheduler.add_job(
+        send_weekly_digest,
+        CronTrigger(day_of_week="sun", hour=21, minute=30, timezone=NAIROBI_TZ),
+        args=[app],
+        id="weekly_digest"
     )
     scheduler.start()
 
