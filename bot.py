@@ -1,5 +1,7 @@
 import logging
 import os
+import random
+import httpx
 from collections import Counter
 from datetime import datetime, timedelta
 from telegram import Update
@@ -246,6 +248,66 @@ async def ask_ai(question: str, context: str | None = None) -> str:
         return "⚠️ Sorry, I couldn't reach the AI just now. Try again in a moment."
 
 
+# ── Motivational quotes ────────────────────────────────────────────────────────
+# Pulled from free, keyless APIs: ZenQuotes (broad variety, thousands of authors)
+# mixed with the Stoicism Quote API (guarantees Marcus Aurelius, Seneca, Epictetus
+# show up regularly). Falls back to this local list if both APIs are unreachable.
+
+QUOTES = [
+    ("Code is poetry.", "Unknown"),
+    ("We are all born ignorant, but one must work hard to remain stupid.", "Benjamin Franklin"),
+    ("Most of us will do anything to avoid facing ourselves.", "Lolly Daskal"),
+    ("Doing the best at this moment puts you in the best place for the next moment.", "Oprah Winfrey"),
+    ("You have power over your mind - not outside events. Realize this, and you will find strength.", "Marcus Aurelius"),
+    ("The impediment to action advances action. What stands in the way becomes the way.", "Marcus Aurelius"),
+    ("Discipline is choosing between what you want now and what you want most.", "Abraham Lincoln"),
+    ("It always seems impossible until it's done.", "Nelson Mandela"),
+    ("Small daily improvements are the key to staggering long-term results.", "Unknown"),
+    ("The expert in anything was once a beginner.", "Helen Hayes"),
+    ("Don't watch the clock; do what it does. Keep going.", "Sam Levenson"),
+    ("You don't have to be great to start, but you have to start to be great.", "Zig Ziglar"),
+]
+
+
+async def fetch_quote_online() -> tuple[str, str]:
+    """
+    Fetch a random quote from free, keyless APIs.
+    ~35% chance of pulling from the Stoicism Quote API (Marcus Aurelius, Seneca,
+    Epictetus); otherwise ZenQuotes for broader variety. Falls back to the local
+    QUOTES list if both are unreachable.
+    """
+    async with httpx.AsyncClient(timeout=8) as client:
+        try:
+            if random.random() < 0.35:
+                resp = await client.get("https://stoicismquote.com/api/v1/quote/random")
+                resp.raise_for_status()
+                data = resp.json()
+                item = data[0] if isinstance(data, list) else data
+                quote = (item.get("quote") or item.get("text") or "").strip()
+                author = (item.get("author") or "Stoic Philosopher").strip()
+                if quote:
+                    return quote, author
+        except Exception as e:
+            logger.warning(f"Stoicism quote API failed, trying ZenQuotes: {e}")
+
+        try:
+            resp = await client.get("https://zenquotes.io/api/random")
+            resp.raise_for_status()
+            data = resp.json()
+            item = data[0]
+            return item["q"].strip(), item["a"].strip()
+        except Exception as e:
+            logger.warning(f"ZenQuotes API failed, falling back to local list: {e}")
+
+    return random.choice(QUOTES)
+
+
+async def send_quote(app: Application):
+    quote, author = await fetch_quote_online()
+    msg = f"💡 \"{quote}\"\n— {author}"
+    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+
+
 # ── Scheduled messages ────────────────────────────────────────────────────────
 
 async def send_morning_message(app: Application):
@@ -357,6 +419,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/summary — trigger evening summary now\n"
         "/morning — trigger morning message now\n"
         "/digest — trigger weekly digest now\n"
+        "/quote — get a random motivational quote\n"
         "/ask <question> — ask me anything, including about your own progress\n\n"
         "You can also just type a plain question and I'll answer it.",
         parse_mode="Markdown"
@@ -409,6 +472,10 @@ async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_weekly_digest(context.application)
+
+
+async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_quote(context.application)
 
 
 async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,6 +538,7 @@ def main():
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("morning", cmd_morning))
     app.add_handler(CommandHandler("digest",  cmd_digest))
+    app.add_handler(CommandHandler("quote",   cmd_quote))
     app.add_handler(CommandHandler("streak",  cmd_streak))
     app.add_handler(CommandHandler("ask",     cmd_ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -495,6 +563,17 @@ def main():
         args=[app],
         id="weekly_digest"
     )
+    QUOTE_TIMES = [
+        (6, 0), (7, 30), (9, 0), (10, 30), (12, 0), (13, 30),
+        (15, 0), (16, 30), (18, 0), (19, 30), (21, 0), (22, 30),
+    ]
+    for hour, minute in QUOTE_TIMES:
+        scheduler.add_job(
+            send_quote,
+            CronTrigger(hour=hour, minute=minute, timezone=NAIROBI_TZ),
+            args=[app],
+            id=f"quote_{hour:02d}{minute:02d}"
+        )
     scheduler.start()
 
     logger.info("Bot is running...")
