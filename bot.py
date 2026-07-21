@@ -225,8 +225,9 @@ async def build_notion_context(days: int = 30) -> str:
 async def ask_ai(question: str, context: str | None = None) -> str:
     system = (
         "You are a friendly, encouraging assistant embedded in Brian's personal "
-        "daily habit tracker Telegram bot. Keep answers short (a few sentences), "
-        "conversational, and suited for a Telegram message. If given tracker data, "
+        "daily habit tracker Telegram bot. Keep answers to 3-5 short sentences, "
+        "conversational, and suited for a Telegram message. Always finish your "
+        "thought completely - never cut off mid-sentence. If given tracker data, "
         "base your answer on it precisely rather than guessing."
     )
     user_content = question
@@ -239,7 +240,7 @@ async def ask_ai(question: str, context: str | None = None) -> str:
             contents=user_content,
             config=types.GenerateContentConfig(
                 system_instruction=system,
-                max_output_tokens=400,
+                max_output_tokens=1024,
             ),
         )
         return response.text.strip()
@@ -306,6 +307,52 @@ async def send_quote(app: Application):
     quote, author = await fetch_quote_online()
     msg = f"💡 \"{quote}\"\n— {author}"
     await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+
+
+async def ask_ai_with_search(question: str) -> str:
+    """
+    Same as ask_ai, but grounds the answer in real, current web results via
+    Gemini's built-in Google Search tool - so links and facts are real,
+    not just recalled from training data.
+    """
+    system = (
+        "You are a friendly assistant embedded in Brian's daily habit tracker "
+        "Telegram bot. He wants a real, current article or resource on a topic. "
+        "Use Google Search to find something genuinely useful and recent. "
+        "Reply with the article title, a one-sentence summary of what it covers, "
+        "and the real URL. Keep it to 3-5 sentences total, suited for Telegram."
+    )
+    try:
+        response = await genai_client.aio.models.generate_content(
+            model="gemini-flash-latest",
+            contents=question,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=1024,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        answer = response.text.strip()
+
+        # Append real source links from grounding metadata, if available
+        try:
+            candidate = response.candidates[0]
+            chunks = candidate.grounding_metadata.grounding_chunks
+            if chunks:
+                links = []
+                for chunk in chunks[:3]:
+                    if chunk.web and chunk.web.uri:
+                        title = chunk.web.title or chunk.web.uri
+                        links.append(f"🔗 {title}\n{chunk.web.uri}")
+                if links:
+                    answer += "\n\n" + "\n\n".join(links)
+        except Exception:
+            pass  # grounding metadata is best-effort; don't fail the whole reply over it
+
+        return answer
+    except Exception as e:
+        logger.error(f"Gemini search-grounded call failed: {e}")
+        return "⚠️ Sorry, I couldn't search for that just now. Try again in a moment."
 
 
 # ── Scheduled messages ────────────────────────────────────────────────────────
@@ -420,6 +467,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/morning — trigger morning message now\n"
         "/digest — trigger weekly digest now\n"
         "/quote — get a random motivational quote\n"
+        "/article <topic> — find a real, current article on a topic\n"
         "/ask <question> — ask me anything, including about your own progress\n\n"
         "You can also just type a plain question and I'll answer it.",
         parse_mode="Markdown"
@@ -478,6 +526,19 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_quote(context.application)
 
 
+async def cmd_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(context.args)
+    if not topic:
+        await update.message.reply_text(
+            "Tell me a topic, e.g. `/article python async programming`",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.chat.send_action("typing")
+    answer = await ask_ai_with_search(f"Find me a good, current article about: {topic}")
+    await update.message.reply_text(answer)
+
+
 async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logs = await fetch_recent_logs(90)
     current, longest = compute_streaks(logs)
@@ -497,10 +558,21 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await answer_question(update, question)
 
 
+ARTICLE_KEYWORDS = ("article", "read", "resource", "tutorial", "guide", "blog post")
+
+
+def looks_like_article_request(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in ARTICLE_KEYWORDS)
+
+
 async def answer_question(update: Update, question: str):
     await update.message.chat.send_action("typing")
-    context_data = await build_notion_context(30) if looks_data_related(question) else None
-    answer = await ask_ai(question, context_data)
+    if looks_like_article_request(question):
+        answer = await ask_ai_with_search(question)
+    else:
+        context_data = await build_notion_context(30) if looks_data_related(question) else None
+        answer = await ask_ai(question, context_data)
     await update.message.reply_text(answer)
 
 
@@ -539,6 +611,7 @@ def main():
     app.add_handler(CommandHandler("morning", cmd_morning))
     app.add_handler(CommandHandler("digest",  cmd_digest))
     app.add_handler(CommandHandler("quote",   cmd_quote))
+    app.add_handler(CommandHandler("article", cmd_article))
     app.add_handler(CommandHandler("streak",  cmd_streak))
     app.add_handler(CommandHandler("ask",     cmd_ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
