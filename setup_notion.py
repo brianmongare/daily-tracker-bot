@@ -19,6 +19,8 @@ try:
             "Score": {"number": {"format": "percent"}},
             "Completed": {"rich_text": {}},
             "Missed": {"rich_text": {}},
+            "Resources": {"rich_text": {}},
+            "Goal": {"rich_text": {}},
         }
     )
     print("✅ Notion database columns created successfully!")
