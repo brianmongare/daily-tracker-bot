@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import random
-import httpx
 from collections import Counter
 from datetime import datetime, timedelta
 from telegram import Update
@@ -337,9 +336,6 @@ async def ask_ai(question: str, context: str | None = None) -> str:
 
 
 # ── Motivational quotes ────────────────────────────────────────────────────────
-# Pulled from free, keyless APIs: ZenQuotes (broad variety, thousands of authors)
-# mixed with the Stoicism Quote API (guarantees Marcus Aurelius, Seneca, Epictetus
-# show up regularly). Falls back to this local list if both are unreachable.
 
 QUOTES = [
     ("Code is poetry.", "Unknown"),
@@ -359,42 +355,8 @@ QUOTES = [
 ]
 
 
-async def fetch_quote_online() -> tuple[str, str]:
-    """
-    Fetch a random quote from free, keyless APIs.
-    ~35% chance of pulling from the Stoicism Quote API (Marcus Aurelius, Seneca,
-    Epictetus); otherwise ZenQuotes for broader variety. Falls back to the local
-    QUOTES list if both are unreachable.
-    """
-    async with httpx.AsyncClient(timeout=8) as client:
-        try:
-            if random.random() < 0.35:
-                resp = await client.get("https://stoicismquote.com/api/v1/quote/random")
-                resp.raise_for_status()
-                data = resp.json()
-                item = data[0] if isinstance(data, list) else data
-                quote = (item.get("quote") or item.get("text") or "").strip()
-                author = (item.get("author") or "Stoic Philosopher").strip()
-                if quote:
-                    return quote, author
-        except Exception as e:
-            logger.warning(f"Stoicism quote API failed, trying ZenQuotes: {e}")
-
-        try:
-            resp = await client.get("https://zenquotes.io/api/random")
-            resp.raise_for_status()
-            data = resp.json()
-            item = data[0]
-            return item["q"].strip(), item["a"].strip()
-        except Exception as e:
-            logger.warning(
-                f"ZenQuotes API failed, falling back to local list: {e}")
-
-    return random.choice(QUOTES)
-
-
 async def send_quote(app: Application):
-    quote, author = await fetch_quote_online()
+    quote, author = random.choice(QUOTES)
     msg = f"💡 \"{quote}\"\n— {author}"
     await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
 
@@ -425,7 +387,7 @@ async def ask_ai_learn(topic: str) -> str:
             contents=topic,
             config=types.GenerateContentConfig(
                 system_instruction=system,
-                max_output_tokens=1024,
+                max_output_tokens=2048,
             ),
         )
         return response.text.strip()
@@ -434,7 +396,63 @@ async def ask_ai_learn(topic: str) -> str:
         return "⚠️ Sorry, I couldn't reach the AI just now. Try again in a moment."
 
 
-async def ask_ai_with_search(question: str) -> str:
+async def propose_next_goal() -> tuple[str, int]:
+    """
+    Asks Gemini to propose a short, concretely achievable next goal for Brian,
+    tied to his Python/FastAPI/DSA learning path and Graville Operations work.
+    Returns (goal_text, duration_days). Falls back to a safe default on failure.
+    """
+    system = (
+        "You are Brian's accountability partner. He's a developer working toward "
+        "Machine Learning engineering, currently building skills in Python, FastAPI, "
+        "and data structures & algorithms, using his real production app Graville "
+        "Operations as practice. Propose ONE short, concretely achievable goal he "
+        "could finish in 2-4 days - specific and scoped (not vague like 'get better "
+        "at Python'). Reply in EXACTLY this format, nothing else:\n"
+        "GOAL: <short goal text>\n"
+        "DAYS: <number of days, 2-4>"
+    )
+    try:
+        response = await genai_client.aio.models.generate_content(
+            model="gemini-flash-latest",
+            contents="Propose my next goal.",
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=200,
+            ),
+        )
+        text = response.text.strip()
+        goal_text = "Practice DSA for 20 minutes daily"
+        days = 3
+        for line in text.splitlines():
+            if line.strip().upper().startswith("GOAL:"):
+                goal_text = line.split(":", 1)[1].strip()
+            elif line.strip().upper().startswith("DAYS:"):
+                try:
+                    days = int(
+                        "".join(c for c in line.split(":", 1)[1] if c.isdigit()))
+                except ValueError:
+                    pass
+        days = max(2, min(days, 4))
+        return goal_text, days
+    except Exception as e:
+        logger.error(f"Goal proposal failed: {e}")
+        return "Practice DSA for 20 minutes daily", 3
+
+
+async def auto_set_next_goal(update: Update):
+    goal_text, days = await propose_next_goal()
+    goal_data = load_goal_data()
+    goal_data["active"] = {
+        "text": goal_text,
+        "start_date": today_key(),
+        "duration_days": days,
+    }
+    save_goal_data(goal_data)
+    await update.message.reply_text(
+        f"🎯 Your next goal: \"{goal_text}\"\n"
+        f"Deadline: {days} day(s). Short and doable - let's go!"
+    )
     """
     Same as ask_ai, but grounds the answer in real, current web results via
     Gemini's built-in Google Search tool - so links and facts are real,
@@ -702,14 +720,25 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args)
+    goal_data = load_goal_data()
+    active = goal_data.get("active")
+
     if not topic:
-        await update.message.reply_text(
-            "Tell me a topic, e.g. `/article python async programming`",
-            parse_mode="Markdown"
-        )
-        return
+        if active:
+            topic = active["text"]
+        else:
+            await update.message.reply_text(
+                "Tell me a topic, e.g. `/article python async programming` "
+                "(or set a /goal and I'll default to that)",
+                parse_mode="Markdown"
+            )
+            return
+
     await update.message.chat.send_action("typing")
-    answer = await ask_ai_with_search(f"Find me a good, current article about: {topic}")
+    query = f"Find me a good, current article that helps with: {topic}"
+    if active and active["text"] not in topic:
+        query += f" (this is in service of my current goal: {active['text']})"
+    answer = await ask_ai_with_search(query)
     await update.message.reply_text(answer)
 
 
@@ -801,9 +830,10 @@ async def cmd_goaldone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goal_data["active"] = None
     save_goal_data(goal_data)
     await update.message.reply_text(
-        f"🏆 Nailed it: \"{active['text']}\"! That's {goal_data['achieved_count']} goal(s) achieved.\n"
-        f"Set your next one with /goal whenever you're ready."
+        f"🏆 Nailed it: \"{active['text']}\"! That's {goal_data['achieved_count']} goal(s) achieved."
     )
+    await update.message.chat.send_action("typing")
+    await auto_set_next_goal(update)
 
 
 async def cmd_goalfail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -816,9 +846,10 @@ async def cmd_goalfail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goal_data["active"] = None
     save_goal_data(goal_data)
     await update.message.reply_text(
-        f"Not this time on \"{active['text']}\" — that's okay, it happens.\n"
-        f"Set a new goal (maybe smaller in scope) with /goal whenever you're ready."
+        f"Not this time on \"{active['text']}\" — that's okay, it happens."
     )
+    await update.message.chat.send_action("typing")
+    await auto_set_next_goal(update)
 
 
 async def cmd_goalextend(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -844,11 +875,17 @@ async def cmd_goalextend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args)
     if not topic:
-        await update.message.reply_text(
-            "Ask me to explain something, e.g. `/learn dependency injection in FastAPI`",
-            parse_mode="Markdown"
-        )
-        return
+        goal_data = load_goal_data()
+        active = goal_data.get("active")
+        if active:
+            topic = f"Help me make progress on: {active['text']}"
+        else:
+            await update.message.reply_text(
+                "Ask me to explain something, e.g. `/learn dependency injection in FastAPI` "
+                "(or set a /goal and I'll default to that)",
+                parse_mode="Markdown"
+            )
+            return
     await update.message.chat.send_action("typing")
     answer = await ask_ai_learn(topic)
     await update.message.reply_text(answer)
@@ -905,6 +942,7 @@ def main():
     app.add_handler(CommandHandler("done",    cmd_done))
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("resource", cmd_resource))
+    app.add_handler(CommandHandler("resources", cmd_resource))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("morning", cmd_morning))
     app.add_handler(CommandHandler("digest",  cmd_digest))
