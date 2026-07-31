@@ -339,7 +339,7 @@ async def ask_ai(question: str, context: str | None = None) -> str:
 # ── Motivational quotes ────────────────────────────────────────────────────────
 # Pulled from free, keyless APIs: ZenQuotes (broad variety, thousands of authors)
 # mixed with the Stoicism Quote API (guarantees Marcus Aurelius, Seneca, Epictetus
-# show up regularly). Falls back to this local list if both APIs are unreachable.
+# show up regularly). Falls back to this local list if both are unreachable.
 
 QUOTES = [
     ("Code is poetry.", "Unknown"),
@@ -439,6 +439,12 @@ async def ask_ai_with_search(question: str) -> str:
     Same as ask_ai, but grounds the answer in real, current web results via
     Gemini's built-in Google Search tool - so links and facts are real,
     not just recalled from training data.
+
+    NOTE: Google Search grounding has a separate, much stricter quota than
+    normal Gemini text generation. Only call this from an explicit request
+    (the /article command) - do NOT auto-route casual messages here, or
+    you'll burn through the daily grounding quota fast (this caused repeated
+    429 RESOURCE_EXHAUSTED errors previously).
     """
     system = (
         "You are a friendly assistant embedded in Brian's daily habit tracker "
@@ -477,6 +483,8 @@ async def ask_ai_with_search(question: str) -> str:
         return answer
     except Exception as e:
         logger.error(f"Gemini search-grounded call failed: {e}")
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            return "⚠️ I've hit today's search limit for finding articles. Try again tomorrow, or ask me directly without /article - I can still answer from what I know."
         return "⚠️ Sorry, I couldn't search for that just now. Try again in a moment."
 
 
@@ -528,7 +536,7 @@ async def send_evening_summary(app: Application):
         resources_block = f"*Resources used today:*\n{resources_list}\n\n"
 
     msg = (
-        f"🌙 *Day-End Check-in (12:00 AM)*\n\n"
+        f"🌙 *Day-End Check-in*\n\n"
         f"{build_activity_list(checked)}\n\n"
         f"*Score: {done}/{total} ({pct}%)*\n\n"
         f"{resources_block}"
@@ -634,8 +642,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/goalfail — mark the active goal not achieved\n"
         "/goalextend <days> — keep the active goal going longer\n"
         "/ask <question> — ask me anything, including about your own progress\n\n"
-        "You can also just type a plain question and I'll answer it.\n\n"
-        "Day-end check-in is now at 12:00 AM.",
+        "You can also just type a plain question and I'll answer it.",
         parse_mode="Markdown"
     )
 
@@ -855,22 +862,15 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await answer_question(update, question)
 
 
-ARTICLE_KEYWORDS = ("article", "read", "resource",
-                    "tutorial", "guide", "blog post")
-
-
-def looks_like_article_request(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in ARTICLE_KEYWORDS)
-
-
 async def answer_question(update: Update, question: str):
+    """
+    Plain-text questions and /ask always go through the regular (non-search)
+    Gemini call. Real web search is reserved for the explicit /article command,
+    to conserve the much stricter Google Search grounding quota.
+    """
     await update.message.chat.send_action("typing")
-    if looks_like_article_request(question):
-        answer = await ask_ai_with_search(question)
-    else:
-        context_data = await build_notion_context(30) if looks_data_related(question) else None
-        answer = await ask_ai(question, context_data)
+    context_data = await build_notion_context(30) if looks_data_related(question) else None
+    answer = await ask_ai(question, context_data)
     await update.message.reply_text(answer)
 
 
@@ -891,7 +891,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"✅ Got it! *{done}/{total} ({pct}%)*\n\n{build_activity_list(checked)}"
         await update.message.reply_text(msg, parse_mode="Markdown")
     else:
-        # Not a number reply — treat it as a question for Claude
         await answer_question(update, text)
 
 
