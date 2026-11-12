@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -96,6 +97,36 @@ logger = logging.getLogger(__name__)
 
 notion = Client(auth=NOTION_TOKEN)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+GEMINI_MODEL = "gemini-3.8-flash"  # main model: pinned stable version, not a "-latest" alias
+# Tried in order if the main model is busy. Each model has its own capacity.
+GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+RETRYABLE_ERRORS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                    "500", "INTERNAL", "overloaded")
+
+
+async def generate_with_retry(contents, config):
+    """
+    Calls Gemini, and if the main model is overloaded (503) or rate-limited,
+    retries once after a short wait, then tries each fallback model in turn.
+    Errors that retrying can't fix (bad API key, bad request) are raised at once.
+    """
+    plan = [(GEMINI_MODEL, 0), (GEMINI_MODEL, 2)] + \
+           [(m, 0) for m in GEMINI_FALLBACK_MODELS]
+    first_error = None
+    for model, delay in plan:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await genai_client.aio.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as e:
+            first_error = first_error or e
+            logger.warning(f"Gemini call failed on {model}: {e}")
+            if model == GEMINI_MODEL and not any(k in str(e) for k in RETRYABLE_ERRORS):
+                raise
+    raise first_error
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -415,8 +446,7 @@ async def ask_ai(question: str, context: str | None = None) -> str:
         user_content = f"{goal_line}Here is Brian's recent tracker data:\n{context}\n\nQuestion: {question}"
 
     try:
-        response = await genai_client.aio.models.generate_content(
-            model="gemini-flash-latest",
+        response = await generate_with_retry(
             contents=user_content,
             config=types.GenerateContentConfig(
                 system_instruction=system,
@@ -476,8 +506,7 @@ async def ask_ai_learn(topic: str) -> str:
         "reply under 12 lines, formatted plainly for Telegram (no markdown tables)."
     )
     try:
-        response = await genai_client.aio.models.generate_content(
-            model="gemini-flash-latest",
+        response = await generate_with_retry(
             contents=topic,
             config=types.GenerateContentConfig(
                 system_instruction=system,
@@ -507,8 +536,7 @@ async def propose_next_goal() -> tuple[str, int]:
         "DAYS: <number of days, 2-4>"
     )
     try:
-        response = await genai_client.aio.models.generate_content(
-            model="gemini-flash-latest",
+        response = await generate_with_retry(
             contents="Propose my next goal.",
             config=types.GenerateContentConfig(
                 system_instruction=system,
@@ -569,8 +597,7 @@ async def ask_ai_with_search(question: str) -> str:
         "and the real URL. Keep it to 3-5 sentences total, suited for Telegram."
     )
     try:
-        response = await genai_client.aio.models.generate_content(
-            model="gemini-flash-latest",
+        response = await generate_with_retry(
             contents=question,
             config=types.GenerateContentConfig(
                 system_instruction=system,
