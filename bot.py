@@ -178,14 +178,18 @@ def build_activity_list(checked: set) -> str:
 
 
 def build_keyboard(checked: set) -> InlineKeyboardMarkup:
-    """One tappable button per activity. Tapping toggles it done / not done."""
-    rows = []
-    for a in ACTIVITIES:
-        tick = "✅" if a["id"] in checked else "⬜"
-        rows.append([InlineKeyboardButton(
-            f"{tick} {a['label']} ({a['target']})",
+    """Compact number buttons, 3 per row. Tap a number to toggle that activity.
+    Short equal-width labels keep everything aligned on any phone; the full
+    activity names are shown (left-aligned) in the message text above."""
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✅' if a['id'] in checked else '⬜'} {a['id']}",
             callback_data=f"toggle:{a['id']}"
-        )])
+        )
+        for a in ACTIVITIES
+    ]
+    per_row = 3
+    rows = [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
     return InlineKeyboardMarkup(rows)
 
 
@@ -207,8 +211,9 @@ def build_tracker_text(checked: set, greeting: bool = False) -> str:
 
     return (
         f"{header}{goal_block}"
-        f"Tap an activity when you finish it (tap again to undo).\n\n"
+        f"{build_activity_list(checked)}\n\n"
         f"*Done: {done}/{total} ({pct}%)*\n"
+        f"Tap a number below when you finish it (tap again to undo).\n"
         f"Log a resource with `/resource <link or note>`.{footer}"
     )
 
@@ -373,6 +378,20 @@ async def build_notion_context(days: int = 30) -> str:
     return "\n".join(lines)
 
 
+def ai_error_message(e: Exception) -> str:
+    """Turn a Gemini failure into a message that says what actually went wrong."""
+    err = str(e)
+    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+        return "⚠️ I've hit the Gemini quota for now. Try again in a little while."
+    if "404" in err or "NOT_FOUND" in err:
+        return "⚠️ The AI model name wasn't found. The model setting in bot.py needs updating."
+    if any(k in err for k in ("API key", "API_KEY_INVALID", "PERMISSION_DENIED", "401", "403")):
+        return "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in the server's .env file."
+    if "503" in err or "UNAVAILABLE" in err or "overloaded" in err.lower():
+        return "⚠️ Gemini is overloaded right now. Try again in a minute."
+    return "⚠️ Sorry, I couldn't reach the AI just now. Try again in a moment."
+
+
 async def ask_ai(question: str, context: str | None = None) -> str:
     system = (
         "You are Brian's accountability and learning partner, embedded in his "
@@ -407,7 +426,7 @@ async def ask_ai(question: str, context: str | None = None) -> str:
         return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini API call failed: {e}")
-        return "⚠️ Sorry, I couldn't reach the AI just now. Try again in a moment."
+        return ai_error_message(e)
 
 
 # ── Motivational quotes ────────────────────────────────────────────────────────
@@ -468,7 +487,7 @@ async def ask_ai_learn(topic: str) -> str:
         return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini API call failed: {e}")
-        return "⚠️ Sorry, I couldn't reach the AI just now. Try again in a moment."
+        return ai_error_message(e)
 
 
 async def propose_next_goal() -> tuple[str, int]:
