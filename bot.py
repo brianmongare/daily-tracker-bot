@@ -4,9 +4,10 @@ import os
 import random
 from collections import Counter
 from datetime import datetime, timedelta
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -27,6 +28,9 @@ STREAK_THRESHOLD = 70  # % score needed for a day to "count" toward a streak
 GOAL_STATE_FILE = os.path.join(os.path.dirname(
     os.path.abspath(__file__)), "goal_state.json")
 DEFAULT_GOAL_DAYS = 7  # a goal's default deadline, in days, if none is given
+DAILY_STATE_FILE = os.path.join(os.path.dirname(
+    os.path.abspath(__file__)), "daily_state.json")
+KEEP_STATE_DAYS = 7  # how many days of checked/resources to keep on disk
 
 # ── Activities ────────────────────────────────────────────────────────────────
 ACTIVITIES = [
@@ -45,11 +49,44 @@ ACTIVITIES = [
 ]
 
 # ── State ─────────────────────────────────────────────────────────────────────
-# Stores today's checked activity IDs
+# Stores today's checked activity IDs and logged resources.
+# Both are saved to daily_state.json after every change, so a restart or
+# redeploy mid-day no longer wipes your progress.
 daily_state: dict[str, set] = {}
-
-# Stores today's logged resources (articles/tutorials/videos Brian used)
 daily_resources: dict[str, list] = {}
+
+
+def save_daily_state():
+    """Write checked activities and resources to disk (keeps the last few days)."""
+    try:
+        keep = sorted(set(daily_state) | set(daily_resources))[-KEEP_STATE_DAYS:]
+        data = {
+            "checked": {d: sorted(daily_state.get(d, set())) for d in keep},
+            "resources": {d: daily_resources.get(d, []) for d in keep},
+        }
+        tmp_path = DAILY_STATE_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, DAILY_STATE_FILE)  # atomic: no half-written file
+    except Exception as e:
+        logger.error(f"Failed to save daily state: {e}")
+
+
+def load_daily_state():
+    """Load saved progress at startup. Safe if the file is missing or corrupt."""
+    if not os.path.exists(DAILY_STATE_FILE):
+        return
+    try:
+        with open(DAILY_STATE_FILE, "r") as f:
+            data = json.load(f)
+        for d, ids in data.get("checked", {}).items():
+            daily_state[d] = set(ids)
+        for d, items in data.get("resources", {}).items():
+            daily_resources[d] = list(items)
+        logger.info(f"Restored daily state for {len(daily_state)} day(s)")
+    except Exception as e:
+        logger.error(f"Failed to load daily state: {e}")
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -73,6 +110,7 @@ def get_today_checked() -> set:
 
 def set_today_checked(ids: set):
     daily_state[today_key()] = ids
+    save_daily_state()
 
 
 def get_today_resources() -> list:
@@ -82,6 +120,7 @@ def get_today_resources() -> list:
 def add_today_resource(text: str):
     resources = daily_resources.setdefault(today_key(), [])
     resources.append(text)
+    save_daily_state()
 
 
 # ── Goal tracking ──────────────────────────────────────────────────────────────
@@ -136,6 +175,42 @@ def build_activity_list(checked: set) -> str:
         tick = "✅" if a["id"] in checked else "⬜"
         lines.append(f"{tick} {a['id']}. {a['label']} ({a['target']})")
     return "\n".join(lines)
+
+
+def build_keyboard(checked: set) -> InlineKeyboardMarkup:
+    """One tappable button per activity. Tapping toggles it done / not done."""
+    rows = []
+    for a in ACTIVITIES:
+        tick = "✅" if a["id"] in checked else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{tick} {a['label']} ({a['target']})",
+            callback_data=f"toggle:{a['id']}"
+        )])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_tracker_text(checked: set, greeting: bool = False) -> str:
+    """Message text shown above the buttons (morning greeting or live progress)."""
+    done = len(checked)
+    total = len(ACTIVITIES)
+    pct = round((done / total) * 100) if total > 0 else 0
+    goal_line = format_goal_line(load_goal_data().get("active"))
+    goal_block = f"{goal_line}\n\n" if goal_line else ""
+
+    if greeting:
+        date_str = datetime.now(NAIROBI_TZ).strftime("%A, %d %B %Y")
+        header = f"☀️ *Good morning Brian!*\n_{date_str}_\n\n"
+        footer = "\n\nYou've got this 💪"
+    else:
+        header = f"📊 *Today's Progress — {pct}%*\n\n"
+        footer = ""
+
+    return (
+        f"{header}{goal_block}"
+        f"Tap an activity when you finish it (tap again to undo).\n\n"
+        f"*Done: {done}/{total} ({pct}%)*\n"
+        f"Log a resource with `/resource <link or note>`.{footer}"
+    )
 
 
 def parse_numbers(text: str) -> set:
@@ -453,6 +528,9 @@ async def auto_set_next_goal(update: Update):
         f"🎯 Your next goal: \"{goal_text}\"\n"
         f"Deadline: {days} day(s). Short and doable - let's go!"
     )
+
+
+async def ask_ai_with_search(question: str) -> str:
     """
     Same as ask_ai, but grounds the answer in real, current web results via
     Gemini's built-in Google Search tool - so links and facts are real,
@@ -510,23 +588,10 @@ async def auto_set_next_goal(update: Update):
 
 async def send_morning_message(app: Application):
     checked = get_today_checked()
-    date_str = datetime.now(NAIROBI_TZ).strftime("%A, %d %B %Y")
-    goal_data = load_goal_data()
-    goal_line = format_goal_line(goal_data.get("active"))
-    goal_block = f"{goal_line}\n\n" if goal_line else ""
-    msg = (
-        f"☀️ *Good morning Brian!*\n"
-        f"_{date_str}_\n\n"
-        f"{goal_block}"
-        f"Here are your activities for today:\n\n"
-        f"{build_activity_list(checked)}\n\n"
-        f"Reply with the numbers of activities you complete during the day.\n"
-        f"e.g. `1 3 5` to mark those as done. Log a resource with `/resource <link or note>`.\n\n"
-        f"You've got this 💪"
-    )
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text=msg,
+        text=build_tracker_text(checked, greeting=True),
+        reply_markup=build_keyboard(checked),
         parse_mode="Markdown"
     )
 
@@ -604,6 +669,7 @@ async def send_evening_summary(app: Application):
     # Reset for next day
     daily_state[date_str] = set()
     daily_resources[date_str] = []
+    save_daily_state()
 
 
 async def send_weekly_digest(app: Application):
@@ -667,15 +733,52 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked = get_today_checked()
+    await update.message.reply_text(
+        build_tracker_text(checked),
+        reply_markup=build_keyboard(checked),
+        parse_mode="Markdown"
+    )
+
+
+async def cb_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles a tap on an activity button: toggle it and refresh the message."""
+    query = update.callback_query
+    if query.message is None or query.message.chat_id != TELEGRAM_CHAT_ID:
+        await query.answer()
+        return
+
+    valid_ids = {a["id"] for a in ACTIVITIES}
+    try:
+        activity_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+    if activity_id not in valid_ids:
+        await query.answer()
+        return
+
+    checked = set(get_today_checked())
+    if activity_id in checked:
+        checked.discard(activity_id)
+    else:
+        checked.add(activity_id)
+    set_today_checked(checked)
+
     done = len(checked)
     total = len(ACTIVITIES)
-    pct = round((done / total) * 100) if total > 0 else 0
-    msg = (
-        f"📊 *Today's Progress — {pct}%*\n\n"
-        f"{build_activity_list(checked)}\n\n"
-        f"Reply with numbers to check off more, e.g. `2 4`"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    toast = "🎉 100%! Every activity done!" if done == total else f"{done}/{total} done"
+    await query.answer(toast)
+
+    greeting = (query.message.text or "").startswith("☀️")
+    try:
+        await query.edit_message_text(
+            text=build_tracker_text(checked, greeting=greeting),
+            reply_markup=build_keyboard(checked),
+            parse_mode="Markdown"
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.error(f"Failed to refresh tracker message: {e}")
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -699,6 +802,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_today_checked(set())
     daily_resources[today_key()] = []
+    save_daily_state()
     await update.message.reply_text("🔄 Today's progress and resources reset.")
 
 
@@ -935,29 +1039,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    load_daily_state()
+
+    # Only your own chat may use the bot (stops strangers burning Gemini quota)
+    owner = filters.Chat(chat_id=TELEGRAM_CHAT_ID)
 
     # Handlers
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("done",    cmd_done))
-    app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("resource", cmd_resource))
-    app.add_handler(CommandHandler("resources", cmd_resource))
-    app.add_handler(CommandHandler("summary", cmd_summary))
-    app.add_handler(CommandHandler("morning", cmd_morning))
-    app.add_handler(CommandHandler("digest",  cmd_digest))
-    app.add_handler(CommandHandler("quote",   cmd_quote))
-    app.add_handler(CommandHandler("article", cmd_article))
-    app.add_handler(CommandHandler("learn",   cmd_learn))
-    app.add_handler(CommandHandler("streak",  cmd_streak))
-    app.add_handler(CommandHandler("goal",       cmd_goal))
-    app.add_handler(CommandHandler("goalstatus", cmd_goalstatus))
-    app.add_handler(CommandHandler("goaldone",   cmd_goaldone))
-    app.add_handler(CommandHandler("goalfail",   cmd_goalfail))
-    app.add_handler(CommandHandler("goalextend", cmd_goalextend))
-    app.add_handler(CommandHandler("ask",     cmd_ask))
+    app.add_handler(CommandHandler("start",   cmd_start, filters=owner))
+    app.add_handler(CommandHandler("status",  cmd_status, filters=owner))
+    app.add_handler(CommandHandler("done",    cmd_done, filters=owner))
+    app.add_handler(CommandHandler("reset",   cmd_reset, filters=owner))
+    app.add_handler(CommandHandler("resource", cmd_resource, filters=owner))
+    app.add_handler(CommandHandler("resources", cmd_resource, filters=owner))
+    app.add_handler(CommandHandler("summary", cmd_summary, filters=owner))
+    app.add_handler(CommandHandler("morning", cmd_morning, filters=owner))
+    app.add_handler(CommandHandler("digest",  cmd_digest, filters=owner))
+    app.add_handler(CommandHandler("quote",   cmd_quote, filters=owner))
+    app.add_handler(CommandHandler("article", cmd_article, filters=owner))
+    app.add_handler(CommandHandler("learn",   cmd_learn, filters=owner))
+    app.add_handler(CommandHandler("streak",  cmd_streak, filters=owner))
+    app.add_handler(CommandHandler("goal",       cmd_goal, filters=owner))
+    app.add_handler(CommandHandler("goalstatus", cmd_goalstatus, filters=owner))
+    app.add_handler(CommandHandler("goaldone",   cmd_goaldone, filters=owner))
+    app.add_handler(CommandHandler("goalfail",   cmd_goalfail, filters=owner))
+    app.add_handler(CommandHandler("goalextend", cmd_goalextend, filters=owner))
+    app.add_handler(CommandHandler("ask",     cmd_ask, filters=owner))
+    app.add_handler(CallbackQueryHandler(cb_toggle, pattern=r"^toggle:\d+$"))
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_message))
+        owner & filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Scheduler
     scheduler = AsyncIOScheduler(timezone=NAIROBI_TZ)
